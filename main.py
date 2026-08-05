@@ -7,6 +7,22 @@ app = FastAPI()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "GROQ_API_KEY_CUA_BAN_O_DAY")
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# FIX: chọn nhà cung cấp LLM qua biến môi trường LLM_PROVIDER = "groq" | "gemini"
+# Đặt biến này trên Render dashboard (Environment tab), mặc định là "groq"
+# nếu không đặt gì.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
+
+SYSTEM_PROMPT = (
+    "Bạn là Fairy, một trợ lý ảo thân thiện, trả lời ngắn gọn, tự nhiên bằng tiếng Việt. "
+    "Trả lời trong 1-2 câu, không dùng markdown."
+)
 
 # FIX: tạo 1 AsyncClient dùng chung cho cả app, có connection pool + keep-alive
 # tới Groq. Việc này tránh phải bắt tay TCP/TLS mới (thường tốn 200-800ms)
@@ -29,6 +45,60 @@ async def shutdown():
 @app.get("/")
 def root():
     return {"status": "Fairy Voice Assistant Server is running!"}
+
+
+async def call_groq_llm(user_text: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 150,
+    }
+    resp = await http_client.post(GROQ_CHAT_URL, headers=headers, json=payload)
+    if resp.status_code != 200:
+        print(f"[LLM-ERROR] Groq trả về {resp.status_code}: {resp.text}")
+        return ""
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+async def call_gemini_llm(user_text: str) -> str:
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 150},
+    }
+    resp = await http_client.post(GEMINI_URL, headers=headers, json=payload)
+    if resp.status_code != 200:
+        print(f"[LLM-ERROR] Gemini trả về {resp.status_code}: {resp.text}")
+        return ""
+    data = resp.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError):
+        print(f"[LLM-ERROR] Không parse được phản hồi Gemini: {data}")
+        return ""
+
+
+async def get_llm_reply(user_text: str) -> str:
+    t0 = time.time()
+    if LLM_PROVIDER == "gemini":
+        reply = await call_gemini_llm(user_text)
+    else:
+        reply = await call_groq_llm(user_text)
+    print(f"[TIME] Gọi LLM ({LLM_PROVIDER}) mất: {time.time() - t0:.2f}s")
+    return reply
 
 
 @app.websocket("/ws")
@@ -87,6 +157,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     else:
                         print(f"STT Result: {text_result}")
                         await websocket.send_text(text_result)
+
+                        # FIX: gọi LLM để trả lời câu hỏi, chỉ in ra log để xem trước
+                        # (chưa gửi ngược lại ESP32 - bước tiếp theo khi cần TTS/hiển thị).
+                        llm_reply = await get_llm_reply(text_result)
+                        if llm_reply:
+                            print(f"[LLM Reply] {llm_reply}")
+                        else:
+                            print("[LLM Reply] (không có phản hồi)")
                 else:
                     print(f"Lỗi từ Groq API ({response.status_code}): {response.text}")
                     await websocket.send_text("[ERROR] Không nhận diện được giọng nói.")
