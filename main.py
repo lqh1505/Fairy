@@ -52,6 +52,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 "model": (None, "whisper-large-v3-turbo"),
                 "language": (None, "vi"),
                 "temperature": (None, "0"),
+                # FIX: verbose_json trả kèm no_speech_prob / avg_logprob theo từng
+                # segment, giúp phát hiện và loại bỏ kết quả "hallucination"
+                # (model bịa câu khi audio gần như im lặng/toàn tạp âm).
+                "response_format": (None, "verbose_json"),
             }
 
             t_before_groq = time.time()
@@ -61,9 +65,28 @@ async def websocket_endpoint(websocket: WebSocket):
                 print(f"[TIME] Gọi Groq mất: {t_after_groq - t_before_groq:.2f}s")
 
                 if response.status_code == 200:
-                    text_result = response.json().get("text", "")
-                    print(f"STT Result: {text_result}")
-                    await websocket.send_text(text_result)
+                    result_json = response.json()
+                    text_result = result_json.get("text", "").strip()
+                    segments = result_json.get("segments", [])
+
+                    # FIX: kiểm tra độ tin cậy qua các segment để loại bỏ hallucination.
+                    # no_speech_prob cao (gần 1) = model nghĩ đoạn đó không có giọng nói
+                    # nhưng vẫn ráng in ra chữ -> chính là hallucination.
+                    # avg_logprob rất âm (< -1.0) = model không tự tin vào kết quả.
+                    is_hallucinated = False
+                    if segments:
+                        avg_no_speech = sum(s.get("no_speech_prob", 0) for s in segments) / len(segments)
+                        avg_logprob = sum(s.get("avg_logprob", 0) for s in segments) / len(segments)
+                        if avg_no_speech > 0.6 or avg_logprob < -1.0:
+                            is_hallucinated = True
+                        print(f"[DEBUG] no_speech_prob={avg_no_speech:.2f} avg_logprob={avg_logprob:.2f}")
+
+                    if not text_result or is_hallucinated:
+                        print(f"[INFO] Bỏ qua kết quả nghi ngờ hallucination: '{text_result}'")
+                        await websocket.send_text("")
+                    else:
+                        print(f"STT Result: {text_result}")
+                        await websocket.send_text(text_result)
                 else:
                     print(f"Lỗi từ Groq API ({response.status_code}): {response.text}")
                     await websocket.send_text("[ERROR] Không nhận diện được giọng nói.")
