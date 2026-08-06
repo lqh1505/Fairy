@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime, timezone, timedelta
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
@@ -19,10 +20,23 @@ GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_M
 # nếu không đặt gì.
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
 
-SYSTEM_PROMPT = (
-    "Bạn là Fairy, một trợ lý ảo thân thiện, trả lời ngắn gọn, tự nhiên bằng tiếng Việt. "
-    "Trả lời trong 1-2 câu, không dùng markdown."
-)
+VN_TZ = timezone(timedelta(hours=7))  # FIX: múi giờ Việt Nam (UTC+7)
+
+WEEKDAY_VI = ["Hai", "Ba", "Tư", "Năm", "Sáu", "Bảy", "Chủ Nhật"]
+
+
+def build_system_prompt() -> str:
+    # FIX: tạo system prompt MỚI mỗi lần gọi, chèn ngày giờ thực tế theo giờ VN.
+    # Trước đây prompt tĩnh khiến LLM không biết ngày hiện tại và tự bịa
+    # (model chỉ có kiến thức tới lúc huấn luyện, không có đồng hồ thật).
+    now = datetime.now(VN_TZ)
+    weekday = WEEKDAY_VI[now.weekday()]
+    date_str = f"Hôm nay là thứ {weekday}, ngày {now.strftime('%d/%m/%Y')}, giờ hiện tại là {now.strftime('%H:%M')}."
+    return (
+        f"Bạn là Fairy, một trợ lý ảo thân thiện, trả lời ngắn gọn, tự nhiên bằng tiếng Việt. "
+        f"{date_str} "
+        f"Trả lời trong 1-2 câu, không dùng markdown."
+    )
 
 # FIX: tạo 1 AsyncClient dùng chung cho cả app, có connection pool + keep-alive
 # tới Groq. Việc này tránh phải bắt tay TCP/TLS mới (thường tốn 200-800ms)
@@ -42,7 +56,7 @@ async def shutdown():
         await http_client.aclose()
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])  # FIX: hỗ trợ cả HEAD (UptimeRobot dùng để ping)
 def root():
     return {"status": "Fairy Voice Assistant Server is running!"}
 
@@ -55,7 +69,7 @@ async def call_groq_llm(user_text: str) -> str:
     payload = {
         "model": GROQ_LLM_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt()},
             {"role": "user", "content": user_text},
         ],
         "temperature": 0.7,
@@ -75,7 +89,7 @@ async def call_gemini_llm(user_text: str) -> str:
         "Content-Type": "application/json",
     }
     payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "system_instruction": {"parts": [{"text": build_system_prompt()}]},
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 150},
     }
@@ -108,12 +122,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            t_start = time.time()
+            # FIX: t_start giờ đặt SAU khi nhận xong audio, không phải trước.
+            # Trước đây t_start đặt trước receive_bytes() nên "TỔNG thời gian"
+            # vô tình cộng luôn cả khoảng ESP32 đang RẢNH chờ wake word tiếp theo
+            # (có thể vài chục giây), khiến số liệu trông như bị "chậm" dù
+            # thực ra STT+LLM chỉ mất chưa tới 1 giây.
 
             # Nhận dữ liệu audio dạng binary từ ESP32 gửi lên
             audio_bytes = await websocket.receive_bytes()
-            t_received = time.time()
-            print(f"[TIME] Nhận {len(audio_bytes)} bytes mất: {t_received - t_start:.2f}s")
+            t_start = time.time()
+            print(f"[INFO] Nhận {len(audio_bytes)} bytes audio từ ESP32")
 
             # Đẩy sang Groq API để làm STT (dùng client dùng chung, giữ kết nối)
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
