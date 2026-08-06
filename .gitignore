@@ -1,0 +1,17 @@
+# Môi trường ảo Python - không commit lên git
+.venv/
+venv/
+env/
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+
+# File biến môi trường/secrets (nếu sau này bạn tạo file .env)
+.env
+
+# File hệ điều hành/editor
+.DS_Store
+Thumbs.db
+.vscode/

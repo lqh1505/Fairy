@@ -4,8 +4,10 @@ from datetime import datetime, timezone, timedelta
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")  # FIX: phục vụ favicon và các file tĩnh khác
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "GROQ_API_KEY_CUA_BAN_O_DAY")
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -72,6 +74,8 @@ DASHBOARD_HTML = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Fairy Voice Assistant</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/favicon-180.png">
 <style>
     body {
         background: #0f1117; color: #e6e6e6;
