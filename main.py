@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import uuid
 from datetime import datetime, timezone, timedelta
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -213,7 +215,27 @@ async def get_llm_reply(user_text: str) -> str:
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("ESP32 Connected via WebSocket!")
+
+    # FIX: bắt tay "hello" kiểu Xiaozhi - client gửi JSON mô tả thiết bị,
+    # server phản hồi kèm session_id. Đây là bước khởi tạo PHIÊN, không
+    # phải khởi tạo cho từng câu nói riêng lẻ như trước.
+    session_id = str(uuid.uuid4())[:8]
+    try:
+        hello_raw = await websocket.receive_text()
+        hello_data = json.loads(hello_raw)
+        device_id = hello_data.get("device_id", "unknown")
+        print(f"[SESSION {session_id}] Hello từ thiết bị '{device_id}': {hello_data}")
+    except Exception as e:
+        print(f"[SESSION {session_id}] Hello không hợp lệ ({e}), dùng giá trị mặc định.")
+        device_id = "unknown"
+
+    await websocket.send_text(json.dumps({
+        "type": "hello",
+        "session_id": session_id,
+        "audio_params": {"sample_rate": 16000, "channels": 1, "format": "wav"},
+    }))
+
+    print(f"[SESSION {session_id}] Bắt đầu phiên hội thoại.")
     dashboard_state["esp32_connected"] = True
 
     try:
@@ -224,10 +246,10 @@ async def websocket_endpoint(websocket: WebSocket):
             # (có thể vài chục giây), khiến số liệu trông như bị "chậm" dù
             # thực ra STT+LLM chỉ mất chưa tới 1 giây.
 
-            # Nhận dữ liệu audio dạng binary từ ESP32 gửi lên
+            # Nhận dữ liệu audio dạng binary từ ESP32 gửi lên (1 lượt nói trong phiên)
             audio_bytes = await websocket.receive_bytes()
             t_start = time.time()
-            print(f"[INFO] Nhận {len(audio_bytes)} bytes audio từ ESP32")
+            print(f"[SESSION {session_id}] Nhận {len(audio_bytes)} bytes audio")
 
             # Đẩy sang Groq API để làm STT (dùng client dùng chung, giữ kết nối)
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -266,31 +288,33 @@ async def websocket_endpoint(websocket: WebSocket):
                         print(f"[DEBUG] no_speech_prob={avg_no_speech:.2f} avg_logprob={avg_logprob:.2f}")
 
                     if not text_result or is_hallucinated:
-                        print(f"[INFO] Bỏ qua kết quả nghi ngờ hallucination: '{text_result}'")
-                        await websocket.send_text("")
+                        print(f"[SESSION {session_id}] Bỏ qua kết quả nghi ngờ hallucination: '{text_result}'")
+                        await websocket.send_text(json.dumps({"type": "stt", "text": ""}))
                     else:
-                        print(f"STT Result: {text_result}")
-                        await websocket.send_text(text_result)
+                        print(f"[SESSION {session_id}] STT: {text_result}")
+                        await websocket.send_text(json.dumps({"type": "stt", "text": text_result}))
                         dashboard_state["last_stt"] = text_result
                         dashboard_state["last_updated"] = datetime.now(VN_TZ).strftime('%H:%M:%S %d/%m')
 
-                        # FIX: gọi LLM để trả lời câu hỏi, chỉ in ra log để xem trước
-                        # (chưa gửi ngược lại ESP32 - bước tiếp theo khi cần TTS/hiển thị).
+                        # FIX: gọi LLM để trả lời câu hỏi, gửi kết quả về ESP32
+                        # dưới dạng message riêng {"type": "llm", "text": ...}
                         llm_reply = await get_llm_reply(text_result)
                         if llm_reply:
-                            print(f"[LLM Reply] {llm_reply}")
+                            print(f"[SESSION {session_id}] LLM: {llm_reply}")
                             dashboard_state["last_llm_reply"] = llm_reply
+                            await websocket.send_text(json.dumps({"type": "llm", "text": llm_reply}))
                         else:
-                            print("[LLM Reply] (không có phản hồi)")
+                            print(f"[SESSION {session_id}] LLM: (không có phản hồi)")
+                            await websocket.send_text(json.dumps({"type": "llm", "text": ""}))
                 else:
                     print(f"Lỗi từ Groq API ({response.status_code}): {response.text}")
-                    await websocket.send_text("[ERROR] Không nhận diện được giọng nói.")
+                    await websocket.send_text(json.dumps({"type": "error", "text": "Không nhận diện được giọng nói."}))
             except httpx.TimeoutException:
                 print("[ERROR] Groq API timeout!")
-                await websocket.send_text("[ERROR] Server xử lý quá lâu, thử lại.")
+                await websocket.send_text(json.dumps({"type": "error", "text": "Server xử lý quá lâu, thử lại."}))
 
-            print(f"[TIME] TỔNG thời gian xử lý 1 lượt: {time.time() - t_start:.2f}s")
+            print(f"[SESSION {session_id}] Tổng thời gian xử lý 1 lượt: {time.time() - t_start:.2f}s")
 
     except WebSocketDisconnect:
-        print("ESP32 Disconnected.")
+        print(f"[SESSION {session_id}] Kết thúc phiên (ESP32 ngắt kết nối).")
         dashboard_state["esp32_connected"] = False
