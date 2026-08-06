@@ -3,6 +3,7 @@ import time
 from datetime import datetime, timezone, timedelta
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
@@ -23,6 +24,14 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
 VN_TZ = timezone(timedelta(hours=7))  # FIX: múi giờ Việt Nam (UTC+7)
 
 WEEKDAY_VI = ["Hai", "Ba", "Tư", "Năm", "Sáu", "Bảy", "Chủ Nhật"]
+
+# FIX: trạng thái toàn cục để trang dashboard đọc và hiển thị real-time
+dashboard_state = {
+    "esp32_connected": False,
+    "last_stt": "",
+    "last_llm_reply": "",
+    "last_updated": "",
+}
 
 
 def build_system_prompt() -> str:
@@ -56,9 +65,91 @@ async def shutdown():
         await http_client.aclose()
 
 
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fairy Voice Assistant</title>
+<style>
+    body {
+        background: #0f1117; color: #e6e6e6;
+        font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+        display: flex; justify-content: center; padding: 40px 16px;
+    }
+    .card {
+        background: #171a23; border-radius: 16px; padding: 28px 32px;
+        max-width: 560px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+    }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .sub { color: #8a8f9c; font-size: 13px; margin-bottom: 24px; }
+    .status-row { display: flex; align-items: center; gap: 8px; margin-bottom: 20px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #555; transition: background 0.3s; }
+    .dot.on { background: #3ddc84; box-shadow: 0 0 8px #3ddc84; }
+    .block { background: #1e222d; border-radius: 12px; padding: 16px 18px; margin-bottom: 14px; }
+    .label { color: #8a8f9c; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+    .value { font-size: 16px; line-height: 1.5; word-break: break-word; }
+    .value.empty { color: #555; font-style: italic; }
+    .footer { color: #555; font-size: 12px; margin-top: 20px; text-align: right; }
+</style>
+</head>
+<body>
+    <div class="card">
+        <h1>🧚 Fairy Voice Assistant</h1>
+        <div class="sub">Server đang chạy — dữ liệu tự cập nhật mỗi 2 giây</div>
+
+        <div class="status-row">
+            <div class="dot" id="dot"></div>
+            <span id="connStatus">Đang kiểm tra kết nối ESP32...</span>
+        </div>
+
+        <div class="block">
+            <div class="label">Bạn vừa nói</div>
+            <div class="value" id="lastStt">—</div>
+        </div>
+
+        <div class="block">
+            <div class="label">Fairy trả lời</div>
+            <div class="value" id="lastReply">—</div>
+        </div>
+
+        <div class="footer" id="lastUpdated"></div>
+    </div>
+
+<script>
+async function refresh() {
+    try {
+        const res = await fetch('/status');
+        const data = await res.json();
+        document.getElementById('dot').className = 'dot' + (data.esp32_connected ? ' on' : '');
+        document.getElementById('connStatus').innerText = data.esp32_connected ? 'ESP32 đang kết nối' : 'ESP32 chưa kết nối';
+        setText('lastStt', data.last_stt);
+        setText('lastReply', data.last_llm_reply);
+        document.getElementById('lastUpdated').innerText = data.last_updated ? ('Cập nhật lần cuối: ' + data.last_updated) : '';
+    } catch (e) {}
+}
+function setText(id, text) {
+    const el = document.getElementById(id);
+    if (text) { el.innerText = text; el.classList.remove('empty'); }
+    else { el.innerText = 'Chưa có dữ liệu'; el.classList.add('empty'); }
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
+"""
+
+
 @app.api_route("/", methods=["GET", "HEAD"])  # FIX: hỗ trợ cả HEAD (UptimeRobot dùng để ping)
 def root():
-    return {"status": "Fairy Voice Assistant Server is running!"}
+    return HTMLResponse(DASHBOARD_HTML)
+
+
+@app.get("/status")
+def status():
+    return dashboard_state
 
 
 async def call_groq_llm(user_text: str) -> str:
@@ -119,6 +210,7 @@ async def get_llm_reply(user_text: str) -> str:
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("ESP32 Connected via WebSocket!")
+    dashboard_state["esp32_connected"] = True
 
     try:
         while True:
@@ -175,12 +267,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     else:
                         print(f"STT Result: {text_result}")
                         await websocket.send_text(text_result)
+                        dashboard_state["last_stt"] = text_result
+                        dashboard_state["last_updated"] = datetime.now(VN_TZ).strftime('%H:%M:%S %d/%m')
 
                         # FIX: gọi LLM để trả lời câu hỏi, chỉ in ra log để xem trước
                         # (chưa gửi ngược lại ESP32 - bước tiếp theo khi cần TTS/hiển thị).
                         llm_reply = await get_llm_reply(text_result)
                         if llm_reply:
                             print(f"[LLM Reply] {llm_reply}")
+                            dashboard_state["last_llm_reply"] = llm_reply
                         else:
                             print("[LLM Reply] (không có phản hồi)")
                 else:
@@ -194,3 +289,4 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print("ESP32 Disconnected.")
+        dashboard_state["esp32_connected"] = False
